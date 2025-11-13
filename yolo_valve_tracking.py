@@ -17,7 +17,7 @@ import tempfile
 
 
 # --- Model & camera setup ---
-model = YOLO("best.pt")  # 你的Pose模型
+model = YOLO("./models/valve.pt")  # 你的Pose模型
 cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
     print("❌ Cannot open /dev/video0")
