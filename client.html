@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>🛰️ YOLOv8 Docking Visualization — Position & Attitude</title>
+<style>
+  body {
+    margin: 0;
+    font-family: 'Segoe UI', 'Roboto', sans-serif;
+    background: radial-gradient(circle at top, #0c0c0c 0%, #050505 100%);
+    color: #e0e0e0;
+    overflow-x: hidden;
+  }
+  header {
+    text-align: center;
+    padding: 20px;
+    font-size: 1.8em;
+    color: #00e5ff;
+    text-shadow: 0 0 20px rgba(0,229,255,0.6);
+  }
+  .dashboard {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 40px;
+    padding: 20px;
+    flex-wrap: wrap;
+  }
+  .panel {
+    background: rgba(255,255,255,0.05);
+    border-radius: 20px;
+    box-shadow: 0 0 30px rgba(0,229,255,0.2);
+    overflow: hidden;
+    padding: 10px;
+    width: 600px;
+    transition: 0.3s;
+  }
+  .panel:hover { transform: scale(1.02); box-shadow: 0 0 50px rgba(0,229,255,0.4); }
+  .panel h3 {
+    text-align: center;
+    color: #00e5ff;
+    margin-top: 10px;
+  }
+  video {
+    width: 100%;
+    border-radius: 12px;
+    background: #000;
+  }
+  .telemetry {
+    text-align: center;
+    font-size: 1.1em;
+    margin-top: 8px;
+  }
+  .controls { text-align: center; margin-top: 25px; }
+  button {
+    background: linear-gradient(145deg,#00e5ff,#007bff);
+    border: none;
+    color: #fff;
+    font-size: 1.1em;
+    padding: 12px 30px;
+    border-radius: 50px;
+    cursor: pointer;
+    box-shadow: 0 0 25px rgba(0,229,255,0.5);
+    transition: 0.3s;
+  }
+  button:hover { background: linear-gradient(145deg,#00bcd4,#006aff); box-shadow: 0 0 40px rgba(0,229,255,0.7); }
+  footer {
+    margin-top: 30px;
+    text-align: center;
+    font-size: 0.9em;
+    color: #777;
+  }
+</style>
+</head>
+<body>
+  <header>🛰️ YOLOv8 Docking Visualization Dashboard</header>
+
+  <div class="dashboard">
+    <div class="panel">
+      <h3>RAW Camera Feed</h3>
+      <video id="raw" autoplay playsinline></video>
+      <div class="telemetry" id="raw-stats">📶 Bitrate: -- kbps</div>
+    </div>
+
+    <div class="panel">
+      <h3>YOLOv8 Detection & Attitude Indicator</h3>
+      <video id="yolo" autoplay playsinline></video>
+      <div class="telemetry" id="yolo-stats">📶 Bitrate: -- kbps</div>
+      <div class="telemetry" id="offset-stats">📡 Waiting for offset data...</div>
+
+      <!-- 对接可视化仪表 -->
+      <div style="text-align:center;margin-top:10px;">
+        <svg id="docking-visual" width="220" height="220" style="background:#000;border-radius:10px;">
+          <!-- 背景十字 -->
+          <line x1="110" y1="10" x2="110" y2="210" stroke="#222" stroke-dasharray="4,4"/>
+          <line x1="10" y1="110" x2="210" y2="110" stroke="#222" stroke-dasharray="4,4"/>
+
+          <!-- 边界框 -->
+          <rect x="10" y="10" width="200" height="200" stroke="#333" stroke-width="2" fill="none"/>
+
+          <!-- 图像中心（理想位置） -->
+          <circle cx="110" cy="110" r="6" fill="#00e5ff"/>
+
+          <!-- 位置偏差点 -->
+          <circle id="pos-dot" cx="110" cy="110" r="5" fill="#ffff00"/>
+
+          <!-- 垂直倾斜条（上/下） -->
+          <line id="tilt-vert" x1="110" y1="110" x2="110" y2="110"
+                stroke="#ff4444" stroke-width="5" stroke-linecap="round"/>
+
+          <!-- 水平倾斜条（左/右） -->
+          <line id="tilt-horz" x1="110" y1="110" x2="110" y2="110"
+                stroke="#00bfff" stroke-width="5" stroke-linecap="round"/>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="btn">🔗 Connect</button>
+  </div>
+
+  <footer>AI Vision Telemetry • Position + Attitude Visualization • Powered by YOLOv8 + WebRTC</footer>
+
+  <script>
+    const raw=document.getElementById("raw"), yolo=document.getElementById("yolo"), btn=document.getElementById("btn");
+    const rawStats=document.getElementById("raw-stats"), yoloStats=document.getElementById("yolo-stats"), offsetStats=document.getElementById("offset-stats");
+    let pcRaw=null, pcYolo=null, connected=false;
+
+    async function createPeer(videoEl,endpoint){
+      const pc=new RTCPeerConnection();
+      pc.addTransceiver("video",{direction:"recvonly"});
+      pc.ontrack=(e)=>videoEl.srcObject=e.streams[0];
+      const offer=await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const res=await fetch(endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type})});
+      const ans=await res.json();
+      await pc.setRemoteDescription(ans);
+      return pc;
+    }
+
+    async function updateStats(pc,el){
+      let lastBytes=0,lastTime=Date.now();
+      while(connected){
+        const stats=await pc.getStats(); let bytes=null;
+        stats.forEach(r=>{if(r.type==="inbound-rtp"&&r.kind==="video")bytes=r.bytesReceived;});
+        if(bytes!==null){
+          const now=Date.now(); const rate=((bytes-lastBytes)*8/1024/((now-lastTime)/1000)).toFixed(1);
+          lastBytes=bytes; lastTime=now;
+          let color=rate<300?"#f00":rate<800?"#ff0":"#0f0";
+          el.innerHTML=`📶 Bitrate: <span style="color:${color}">${rate}</span> kbps`;
+        }
+        await new Promise(r=>setTimeout(r,1000));
+      }
+    }
+
+    async function updateDockingDisplay(){
+      const posDot=document.getElementById("pos-dot");
+      const tiltVert=document.getElementById("tilt-vert");
+      const tiltHorz=document.getElementById("tilt-horz");
+      const center=110, maxPosRange=80, maxTiltLength=50;
+
+      while(true){
+        if(connected){
+          try{
+            const res=await fetch("/offset");
+            const d=await res.json();
+            const {pos_dx,pos_dy,att_dx,att_dy}=d;
+
+            // --- 更新位置偏差文本 ---
+            offsetStats.innerHTML=`📡 位置(dx=${pos_dx.toFixed(1)}%, dy=${pos_dy.toFixed(1)}%) | 姿态(水平=${att_dx.toFixed(1)}%, 垂直=${att_dy.toFixed(1)}%)`;
+
+            // --- 映射位置点 ---
+            const pos_x=center+(pos_dx/100)*maxPosRange;
+            const pos_y=center+(pos_dy/100)*maxPosRange;
+            posDot.setAttribute("cx",pos_x);
+            posDot.setAttribute("cy",pos_y);
+
+            // --- 垂直倾斜表示 (att_dy) ---
+            const vert_y = pos_y - (att_dy / 100) * maxTiltLength;
+            tiltVert.setAttribute("x1", pos_x);
+            tiltVert.setAttribute("y1", pos_y);
+            tiltVert.setAttribute("x2", pos_x);
+            tiltVert.setAttribute("y2", vert_y);
+
+            // --- 水平倾斜表示 (att_dx) ---
+            const horz_x = pos_x + (att_dx / 100) * maxTiltLength;
+            tiltHorz.setAttribute("x1", pos_x);
+            tiltHorz.setAttribute("y1", pos_y);
+            tiltHorz.setAttribute("x2", horz_x);
+            tiltHorz.setAttribute("y2", pos_y);
+
+            // --- 颜色随误差变化 ---
+            const pos_mag=Math.sqrt(pos_dx**2+pos_dy**2);
+            const tilt_mag=Math.sqrt(att_dx**2+att_dy**2);
+            const color=tilt_mag<5&&pos_mag<5?"#00ff00":tilt_mag<20?"#ffff00":"#ff4444";
+            tiltVert.setAttribute("stroke",color);
+            tiltHorz.setAttribute("stroke",color);
+            posDot.setAttribute("fill",color);
+          }catch(e){}
+        }
+        await new Promise(r=>setTimeout(r,200));
+      }
+    }
+    updateDockingDisplay();
+
+    btn.onclick=async()=>{
+      if(!connected){
+        btn.textContent="⏳ Connecting...";
+        pcRaw=await createPeer(raw,"/offer_raw");
+        pcYolo=await createPeer(yolo,"/offer_yolo");
+        connected=true; btn.textContent="❌ Disconnect";
+        updateStats(pcRaw,rawStats); updateStats(pcYolo,yoloStats);
+      }else{
+        pcRaw.close(); pcYolo.close(); connected=false;
+        raw.srcObject=yolo.srcObject=null;
+        btn.textContent="🔗 Connect";
+        rawStats.textContent="📶 Bitrate: -- kbps";
+        yoloStats.textContent="📶 Bitrate: -- kbps";
+      }
+    };
+  </script>
+</body>
+</html>
