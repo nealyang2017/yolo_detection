@@ -19,7 +19,7 @@ sudo unzip slider.v1i.yolov8.zip -d sliderv1i
 # Train the model with given dataset
 yolo pose train \
   model=yolov8n-pose.pt \
-  data=/workspace/datasets/sliderv1i/data.yaml \
+  data=/workspace/datasets/WRSv4i/data.yaml \
   epochs=100 \
   imgsz=640 \
   batch=8 \
