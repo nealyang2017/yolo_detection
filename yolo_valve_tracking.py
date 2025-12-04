@@ -59,28 +59,33 @@ async def capture_loop():
 async def run_yolo_async(frame):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, lambda: model(frame, verbose=False))
-
-
 def draw_results(frame, results):
     """
-    注意：这里既负责画图，也负责更新 latest_offset + 写入 /dev/shm
-    现在改为：在所有检测框中，选择【距离图像中心最近】的那个，写入 shared memory。
+    视觉检测 + 偏差计算：
+      ✔ 绘制所有检测框（每个都显示 POS/ATT）
+      ✔ 从所有框中选取“离图像中心最近”的目标
+      ✔ 计算 pos_dx / pos_dy
+      ✔ 计算 att_dx / att_dy（基于关键点）
+      ✔ 用 bounding box 高度估计 z_error（距离误差）
+      ✔ 写入 shared memory
     """
     global latest_offset
+
     boxes = results[0].boxes
     kpts = getattr(results[0], "keypoints", None)
 
     h_img, w_img = frame.shape[:2]
-    img_cx, img_cy = w_img // 2, h_img // 2  # 图像中心
+    img_cx, img_cy = w_img // 2, h_img // 2
 
-    # 用来记录“最靠近图像中心”的那个框的偏差
+    # 用于记录最佳目标（最近）
     best_found = False
     best_dist2 = 1e18
     best_pos_dx = best_pos_dy = 0.0
     best_att_dx = best_att_dy = 0.0
+    best_box = None
 
+    # 如果没有检测结果
     if boxes is None or len(boxes) == 0:
-        # 没有检测到目标时，可以选择写 0（也可以选择不写，看你系统需求）
         result_dict = {
             "timestamp": time.time(),
             "x_error": 0.0,
@@ -90,59 +95,58 @@ def draw_results(frame, results):
             "pitch_error": 0.0,
             "yaw_error": 0.0,
         }
-        latest_offset = {
-            "pos_dx": 0.0,
-            "pos_dy": 0.0,
-            "att_dx": 0.0,
-            "att_dy": 0.0,
-        }
+        latest_offset = {"pos_dx": 0, "pos_dy": 0, "att_dx": 0, "att_dy": 0}
         write_to_shm(result_dict)
         return frame
 
+    # =============================
+    #   扫描所有框，画图 + 找最近目标
+    # =============================
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         conf = float(box.conf[0])
         cls = int(box.cls[0])
         label = model.names.get(cls, str(cls))
 
-        # 框中心
+        # 绘制框和中心
         cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
         cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)
 
-        # --- 位置偏差（框中心 vs 图像中心）
+        # --- 位置偏差（百分比）
         pos_dx = (cx - img_cx) / (w_img / 2) * 100
         pos_dy = (cy - img_cy) / (h_img / 2) * 100
 
+        # --- 姿态偏差（关键点）
         att_dx, att_dy = 0.0, 0.0
-
-        # --- 姿态偏差（关键点 vs 框中心）
         if kpts is not None and i < len(kpts.xy):
             for kp in kpts.xy[i]:
                 px, py = int(kp[0]), int(kp[1])
                 cv2.circle(frame, (px, py), 5, (0, 0, 255), -1)
-                cv2.line(frame, (cx, cy), (px, py), (100, 0, 255), 2)
-                w_box, h_box = x2 - x1, y2 - y1
+                cv2.line(frame, (cx, cy), (px, py), (200, 50, 255), 2)
+
+                w_box = x2 - x1
+                h_box = y2 - y1
                 if w_box > 0 and h_box > 0:
                     att_dx = (px - cx) / (w_box / 2) * 100
                     att_dy = (py - cy) / (h_box / 2) * 100
 
-        # 文本叠加（每个框各自显示自己的偏差）
+        # 绘制文字
         text = (
-            f"{label} POS(dx={pos_dx:+.1f}%, dy={pos_dy:+.1f}%) | "
-            f"ATT(dx={att_dx:+.1f}%, dy={att_dy:+.1f}%)"
+            f"{label} POS({pos_dx:+.1f},{pos_dy:+.1f}) "
+            f"ATT({att_dx:+.1f},{att_dy:+.1f})"
         )
         cv2.putText(
             frame,
             text,
-            (x1, y1 - 10),
+            (x1, y1 - 8),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (0, 255, 0),
             1,
         )
 
-        # --- 计算这个框与图像中心的距离平方，用来选“最近”的 ---
+        # --- 计算与图像中心的距离
         dist2 = (cx - img_cx) ** 2 + (cy - img_cy) ** 2
         if dist2 < best_dist2:
             best_dist2 = dist2
@@ -151,29 +155,48 @@ def draw_results(frame, results):
             best_pos_dy = pos_dy
             best_att_dx = att_dx
             best_att_dy = att_dy
+            best_box = (x1, y1, x2, y2)
 
-    # 循环结束后，只用“最近的那个框”的偏差写入 shared memory
-    if best_found:
+    # =============================
+    #   最近目标 → 计算 z_error 并写入 shared memory
+    # =============================
+    if best_found and best_box is not None:
+        x1, y1, x2, y2 = best_box
+        h_box = y2 - y1
+
+        # 🔵 你可以根据相机情况调整 ref_h（理想距离下的像素高度）
+        ref_h = 200.0  # <== 想离近一点就调大，想远一点就调小
+
+        # z_error = (期望 - 实际) / 期望
+        z_error = (ref_h - h_box) / ref_h
+        z_error = max(min(z_error, 1.0), -1.0)  # 限幅 [-1, 1]
+
+        # 输出给共享内存
         latest_offset = {
             "pos_dx": best_pos_dx,
             "pos_dy": best_pos_dy,
             "att_dx": best_att_dx,
             "att_dy": best_att_dy,
+            "z_error": z_error,
         }
 
-        # 这里姿态/z 仍然先放 0，将来你有 z/姿态估计后可替换
-        z_err, roll_err, pitch_err, yaw_err = 0.0, 0.0, 0.0, 0.0
-
-        result_dict = {
+        shm_dict = {
             "timestamp": time.time(),
             "x_error": best_pos_dx,
             "y_error": best_pos_dy,
-            "z_error": z_err,
-            "roll_error": roll_err,
-            "pitch_error": pitch_err,
-            "yaw_error": yaw_err,
+            "z_error": z_error,
+            "roll_error": 0.0,
+            "pitch_error": 0.0,
+            "yaw_error": 0.0,
         }
-        write_to_shm(result_dict)
+        write_to_shm(shm_dict)
+
+        # 在图像上标亮最近目标
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.putText(frame, f"NEAREST z={z_error:+.2f}",
+                    (x1, y1 - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 0), 2)
 
     return frame
 
