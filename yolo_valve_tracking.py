@@ -61,11 +61,10 @@ async def run_yolo_async(frame):
     return await loop.run_in_executor(executor, lambda: model(frame, verbose=False))
 
 
-# --- 绘制检测框 + 关键点 + 偏差 ---
 def draw_results(frame, results):
     """
     注意：这里既负责画图，也负责更新 latest_offset + 写入 /dev/shm
-    所有模式（WebRTC/纯推理）共用这一套逻辑，保证行为一致。
+    现在改为：在所有检测框中，选择【距离图像中心最近】的那个，写入 shared memory。
     """
     global latest_offset
     boxes = results[0].boxes
@@ -73,6 +72,32 @@ def draw_results(frame, results):
 
     h_img, w_img = frame.shape[:2]
     img_cx, img_cy = w_img // 2, h_img // 2  # 图像中心
+
+    # 用来记录“最靠近图像中心”的那个框的偏差
+    best_found = False
+    best_dist2 = 1e18
+    best_pos_dx = best_pos_dy = 0.0
+    best_att_dx = best_att_dy = 0.0
+
+    if boxes is None or len(boxes) == 0:
+        # 没有检测到目标时，可以选择写 0（也可以选择不写，看你系统需求）
+        result_dict = {
+            "timestamp": time.time(),
+            "x_error": 0.0,
+            "y_error": 0.0,
+            "z_error": 0.0,
+            "roll_error": 0.0,
+            "pitch_error": 0.0,
+            "yaw_error": 0.0,
+        }
+        latest_offset = {
+            "pos_dx": 0.0,
+            "pos_dy": 0.0,
+            "att_dx": 0.0,
+            "att_dy": 0.0,
+        }
+        write_to_shm(result_dict)
+        return frame
 
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -102,13 +127,7 @@ def draw_results(frame, results):
                     att_dx = (px - cx) / (w_box / 2) * 100
                     att_dy = (py - cy) / (h_box / 2) * 100
 
-        latest_offset = {
-            "pos_dx": pos_dx,
-            "pos_dy": pos_dy,
-            "att_dx": att_dx,
-            "att_dy": att_dy,
-        }
-
+        # 文本叠加（每个框各自显示自己的偏差）
         text = (
             f"{label} POS(dx={pos_dx:+.1f}%, dy={pos_dy:+.1f}%) | "
             f"ATT(dx={att_dx:+.1f}%, dy={att_dy:+.1f}%)"
@@ -123,14 +142,32 @@ def draw_results(frame, results):
             1,
         )
 
-        # --- 暂不计算姿态，默认 0
+        # --- 计算这个框与图像中心的距离平方，用来选“最近”的 ---
+        dist2 = (cx - img_cx) ** 2 + (cy - img_cy) ** 2
+        if dist2 < best_dist2:
+            best_dist2 = dist2
+            best_found = True
+            best_pos_dx = pos_dx
+            best_pos_dy = pos_dy
+            best_att_dx = att_dx
+            best_att_dy = att_dy
+
+    # 循环结束后，只用“最近的那个框”的偏差写入 shared memory
+    if best_found:
+        latest_offset = {
+            "pos_dx": best_pos_dx,
+            "pos_dy": best_pos_dy,
+            "att_dx": best_att_dx,
+            "att_dy": best_att_dy,
+        }
+
+        # 这里姿态/z 仍然先放 0，将来你有 z/姿态估计后可替换
         z_err, roll_err, pitch_err, yaw_err = 0.0, 0.0, 0.0, 0.0
 
-        # --- 统一写入共享内存（仅写一次）---
         result_dict = {
             "timestamp": time.time(),
-            "x_error": pos_dx,
-            "y_error": pos_dy,
+            "x_error": best_pos_dx,
+            "y_error": best_pos_dy,
             "z_error": z_err,
             "roll_error": roll_err,
             "pitch_error": pitch_err,
@@ -139,6 +176,7 @@ def draw_results(frame, results):
         write_to_shm(result_dict)
 
     return frame
+
 
 
 # --- Video track (用于 WebRTC 模式) ---
