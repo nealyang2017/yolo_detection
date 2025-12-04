@@ -34,5 +34,9 @@ yolo pose train \
 
 
 
+
   rosr shinobi_auto_manipulation shm_reader_node
   roslaunch shinobi_auto_manipulation sixdof_pid.launch
+
+
+  python3 yolo_vale.py --no-webrtc

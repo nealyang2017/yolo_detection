@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import tempfile
+import argparse  # ✅ 新增：命令行参数
 
 
 # --- Model & camera setup ---
@@ -30,6 +31,8 @@ latest_offset = {"pos_dx": 0.0, "pos_dy": 0.0, "att_dx": 0.0, "att_dy": 0.0}
 
 # --- Shared memory file path ---
 SHM_PATH = "/dev/shm/yolo_result"
+
+
 # --- Helper: write result to shared memory ---
 def write_to_shm(result_dict):
     try:
@@ -42,9 +45,7 @@ def write_to_shm(result_dict):
         print(f"⚠️ Shared memory write failed: {e}")
 
 
-
-
-# --- Shared frame capture loop ---
+# --- Shared frame capture loop (for WebRTC 模式用) ---
 async def capture_loop():
     global latest_frame
     while not stop_flag:
@@ -53,13 +54,19 @@ async def capture_loop():
             latest_frame = frame.copy()
         await asyncio.sleep(0.01)
 
+
 # --- Async YOLO inference ---
 async def run_yolo_async(frame):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, lambda: model(frame, verbose=False))
 
+
 # --- 绘制检测框 + 关键点 + 偏差 ---
 def draw_results(frame, results):
+    """
+    注意：这里既负责画图，也负责更新 latest_offset + 写入 /dev/shm
+    所有模式（WebRTC/纯推理）共用这一套逻辑，保证行为一致。
+    """
     global latest_offset
     boxes = results[0].boxes
     kpts = getattr(results[0], "keypoints", None)
@@ -102,12 +109,23 @@ def draw_results(frame, results):
             "att_dy": att_dy,
         }
 
-        text = (f"{label} POS(dx={pos_dx:+.1f}%, dy={pos_dy:+.1f}%) | "
-                f"ATT(dx={att_dx:+.1f}%, dy={att_dy:+.1f}%)")
-        cv2.putText(frame, text, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        text = (
+            f"{label} POS(dx={pos_dx:+.1f}%, dy={pos_dy:+.1f}%) | "
+            f"ATT(dx={att_dx:+.1f}%, dy={att_dy:+.1f}%)"
+        )
+        cv2.putText(
+            frame,
+            text,
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 255, 0),
+            1,
+        )
+
         # --- 暂不计算姿态，默认 0
         z_err, roll_err, pitch_err, yaw_err = 0.0, 0.0, 0.0, 0.0
+
         # --- 统一写入共享内存（仅写一次）---
         result_dict = {
             "timestamp": time.time(),
@@ -116,14 +134,14 @@ def draw_results(frame, results):
             "z_error": z_err,
             "roll_error": roll_err,
             "pitch_error": pitch_err,
-            "yaw_error": yaw_err
+            "yaw_error": yaw_err,
         }
         write_to_shm(result_dict)
 
     return frame
 
 
-# --- Video track ---
+# --- Video track (用于 WebRTC 模式) ---
 class AdaptiveStreamTrack(VideoStreamTrack):
     def __init__(self, mode="raw"):
         super().__init__()
@@ -139,8 +157,15 @@ class AdaptiveStreamTrack(VideoStreamTrack):
         pts, time_base = await self.next_timestamp()
         if latest_frame is None:
             frame = np.zeros((480, 640, 3), np.uint8)
-            cv2.putText(frame, "No Camera Feed", (100, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(
+                frame,
+                "No Camera Feed",
+                (100, 240),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 0, 255),
+                2,
+            )
         else:
             frame = latest_frame.copy()
             if self.mode == "yolo":
@@ -148,8 +173,15 @@ class AdaptiveStreamTrack(VideoStreamTrack):
                 self.last_yolo_result = await run_yolo_async(frame)
                 self.last_infer_time = time.time() - t0
                 frame = draw_results(frame, self.last_yolo_result)
-                cv2.putText(frame, "YOLOv8 Docking Monitor", (10, 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 128, 0), 3)
+                cv2.putText(
+                    frame,
+                    "YOLOv8 Docking Monitor",
+                    (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 128, 0),
+                    3,
+                )
 
             frame = cv2.resize(frame, (1280, 720))
             self.count += 1
@@ -158,9 +190,15 @@ class AdaptiveStreamTrack(VideoStreamTrack):
                 self.fps = self.count / (now - self.last)
                 self.count = 0
                 self.last = now
-            cv2.putText(frame, f"{self.mode.upper()} FPS:{self.fps:.1f}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (0, 255, 0) if self.mode == "raw" else (255, 128, 0), 2)
+            cv2.putText(
+                frame,
+                f"{self.mode.upper()} FPS:{self.fps:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0) if self.mode == "raw" else (255, 128, 0),
+                2,
+            )
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         vf = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
@@ -180,19 +218,29 @@ async def offer_generic(request, mode="raw"):
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+    return web.json_response(
+        {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+    )
 
-async def offer_raw(request): return await offer_generic(request, "raw")
-async def offer_yolo(request): return await offer_generic(request, "yolo")
+
+async def offer_raw(request):
+    return await offer_generic(request, "raw")
+
+
+async def offer_yolo(request):
+    return await offer_generic(request, "yolo")
+
 
 # --- Offset data endpoint ---
 async def get_offset(request):
     return web.json_response(latest_offset)
 
-# --- Startup / Shutdown ---
+
+# --- Startup / Shutdown (仅 WebRTC 模式用) ---
 async def on_startup(app):
     print("🚀 Starting capture loop...")
     app["cap_task"] = asyncio.create_task(capture_loop())
+
 
 async def on_shutdown(app):
     global stop_flag
@@ -204,7 +252,8 @@ async def on_shutdown(app):
     cap.release()
     print("✅ Shutdown complete")
 
-# --- App setup ---
+
+# --- App setup (WebRTC 模式用) ---
 app = web.Application()
 app.router.add_post("/offer_raw", offer_raw)
 app.router.add_post("/offer_yolo", offer_yolo)
@@ -213,6 +262,63 @@ app.router.add_static("/", path=".", show_index=True)
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
+
+# --- YOLO-only 模式：只推理 + 写共享内存，不启动 WebRTC ---
+async def yolo_only_loop():
+    global stop_flag
+    print("🚀 YOLO-only shared memory mode started (no WebRTC)")
+    try:
+        while not stop_flag:
+            ret, frame = cap.read()
+            if not ret:
+                await asyncio.sleep(0.01)
+                continue
+
+            # 与 WebRTC 中的 YOLO 完全共用同一套逻辑
+            results = await run_yolo_async(frame)
+            _ = draw_results(frame, results)  # 不需要显示，只为了计算 + 写 shm
+
+            # 适当睡一点，避免把 CPU 吃满
+            await asyncio.sleep(0.001)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print("🛑 YOLO-only loop stopped")
+
+
+async def yolo_only_main():
+    global stop_flag
+    stop_flag = False
+    task = asyncio.create_task(yolo_only_loop())
+    try:
+        await task
+    finally:
+        stop_flag = True
+        cap.release()
+        executor.shutdown(wait=False)
+        print("✅ YOLO-only mode shutdown complete")
+
+
 if __name__ == "__main__":
-    print("🌐 YOLOv8 Docking Visualization Server running at http://0.0.0.0:8080")
-    web.run_app(app, host="0.0.0.0", port=8080)
+    parser = argparse.ArgumentParser(
+        description="YOLOv8 + WebRTC docking monitor / shared memory server"
+    )
+    parser.add_argument(
+        "--no-webrtc",
+        action="store_true",
+        help="Disable WebRTC server and only run YOLO inference + shared memory output",
+    )
+    args = parser.parse_args()
+
+    if args.no_webrtc:
+        # 纯推理 + 写共享内存模式
+        try:
+            asyncio.run(yolo_only_main())
+        except KeyboardInterrupt:
+            print("🧹 Interrupted by user (Ctrl+C)")
+    else:
+        # 原来的完整 WebRTC 服务器模式
+        print(
+            "🌐 YOLOv8 Docking Visualization Server running at http://0.0.0.0:8080"
+        )
+        web.run_app(app, host="0.0.0.0", port=8080)
