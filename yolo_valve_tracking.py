@@ -3,383 +3,346 @@ import time
 import cv2
 import numpy as np
 from aiohttp import web
-from aiortc import (
-    RTCPeerConnection,
-    RTCSessionDescription,
-    VideoStreamTrack,
-)
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from av import VideoFrame
 from ultralytics import YOLO
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-import tempfile
-import argparse  # ✅ 新增：命令行参数
+import argparse
 
+# =========================================================
+# Configuration
+# =========================================================
+YOLO_PERIOD = 0.1                 # <= 10 Hz
+REF_H_RATIO = 0.28                # relative image height for z
+CENTER_FUSE_ALPHA = 0.7
+ATT_LPF_ALPHA = 0.25              # pitch/yaw low-pass
+Z_LPF_ALPHA = 0.3                 # z low-pass
+EPS = 1e-6
 
-# --- Model & camera setup ---
-model = YOLO("./models/valve.pt")  # 你的Pose模型
-cap = cv2.VideoCapture("/dev/video0")
-if not cap.isOpened():
-    print("❌ Cannot open /dev/video0")
-
-pcs = set()
-latest_frame = None
-stop_flag = False
-executor = ThreadPoolExecutor(max_workers=1)
-latest_offset = {"pos_dx": 0.0, "pos_dy": 0.0, "att_dx": 0.0, "att_dy": 0.0}
-
-# --- Shared memory file path ---
 SHM_PATH = "/dev/shm/yolo_result"
 
+# =========================================================
+# Global states
+# =========================================================
+latest_frame = None
+stop_flag = False
+pcs = set()
 
-# --- Helper: write result to shared memory ---
-def write_to_shm(result_dict):
+last_pitch_error = 0.0
+last_yaw_error = 0.0
+last_z_error = 0.0
+
+latest_offset = {
+    "pos_dx": 0.0,
+    "pos_dy": 0.0,
+    "att_dx": 0.0,
+    "att_dy": 0.0,
+    "z_error": 0.0,
+    "pitch_error": 0.0,
+    "yaw_error": 0.0,
+}
+
+# =========================================================
+# Model & Camera
+# =========================================================
+model = YOLO("./models/valve.pt")
+cap = cv2.VideoCapture("/dev/video0")
+if not cap.isOpened():
+    raise RuntimeError("Cannot open camera")
+
+executor = ThreadPoolExecutor(max_workers=1)
+
+# =========================================================
+# Utilities
+# =========================================================
+def write_to_shm(data):
     try:
-        data = json.dumps(result_dict)
-        tmp_path = SHM_PATH + ".tmp"
-        with open(tmp_path, "w") as f:
-            f.write(data)
-        os.replace(tmp_path, SHM_PATH)  # 原子替换，防止读写冲突
+        tmp = SHM_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, SHM_PATH)
     except Exception as e:
-        print(f"⚠️ Shared memory write failed: {e}")
+        print("SHM write failed:", e)
 
+def lpf(prev, curr, alpha):
+    return (1.0 - alpha) * prev + alpha * curr
 
-# --- Shared frame capture loop (for WebRTC 模式用) ---
+# =========================================================
+# Capture Loop
+# =========================================================
 async def capture_loop():
     global latest_frame
     while not stop_flag:
         ret, frame = cap.read()
         if ret:
-            latest_frame = frame.copy()
+            latest_frame = frame
         await asyncio.sleep(0.01)
 
-
-# --- Async YOLO inference ---
+# =========================================================
+# YOLO async
+# =========================================================
 async def run_yolo_async(frame):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, lambda: model(frame, verbose=False))
-def draw_results(frame, results):
-    """
-    视觉检测 + 偏差计算：
-      ✔ 绘制所有检测框（每个都显示 POS/ATT）
-      ✔ 从所有框中选取“离图像中心最近”的目标
-      ✔ 计算 pos_dx / pos_dy
-      ✔ 计算 att_dx / att_dy（基于关键点）
-      ✔ 用 bounding box 高度估计 z_error（距离误差）
-      ✔ 写入 shared memory
-    """
-    global latest_offset
+
+# =========================================================
+# Keypoint role assignment (order-agnostic)
+# =========================================================
+def assign_5kpts_roles(kpts_xy, bbox_center):
+    kpts = np.asarray(kpts_xy, dtype=np.float32)
+    bc = np.asarray(bbox_center, dtype=np.float32)
+
+    d2 = np.sum((kpts - bc) ** 2, axis=1)
+    idx_c = int(np.argmin(d2))
+
+    rem = [i for i in range(5) if i != idx_c]
+    rem_pts = kpts[rem]
+
+    idx_u = rem[int(np.argmin(rem_pts[:, 1]))]
+    idx_d = rem[int(np.argmax(rem_pts[:, 1]))]
+    idx_l = rem[int(np.argmin(rem_pts[:, 0]))]
+    idx_r = rem[int(np.argmax(rem_pts[:, 0]))]
+
+    return {
+        "C": kpts[idx_c],
+        "U": kpts[idx_u],
+        "D": kpts[idx_d],
+        "L": kpts[idx_l],
+        "R": kpts[idx_r],
+    }
+
+# =========================================================
+# Pitch/Yaw estimation
+# =========================================================
+def estimate_pitch_yaw(C, U, D, L, R, bbox_center):
+    C = CENTER_FUSE_ALPHA * C + (1.0 - CENTER_FUSE_ALPHA) * bbox_center
+
+    lu = np.linalg.norm(U - C)
+    ld = np.linalg.norm(D - C)
+    ll = np.linalg.norm(L - C)
+    lr = np.linalg.norm(R - C)
+
+    pitch = (lu - ld) / (lu + ld + EPS)
+    yaw   = (lr - ll) / (lr + ll + EPS)
+    return pitch, yaw
+
+# =========================================================
+# HUD
+# =========================================================
+def draw_hud(frame, x, y, z, pitch, yaw, fps):
+    x0, y0, dy = 10, 30, 28
+    lines = [
+        "VISION STATUS",
+        f"x: {x:+.2f} %",
+        f"y: {y:+.2f} %",
+        f"z: {z:+.3f}",
+        f"pitch: {pitch:+.3f}",
+        f"yaw: {yaw:+.3f}",
+        f"YOLO: {fps:.1f} Hz",
+    ]
+    for i, t in enumerate(lines):
+        cv2.putText(frame, t, (x0, y0 + i * dy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7 if i else 0.8,
+                    (0, 255, 0), 2)
+
+# =========================================================
+# Main processing
+# =========================================================
+def process_and_draw(frame, results):
+    global last_pitch_error, last_yaw_error, last_z_error, latest_offset
+
+    h, w = frame.shape[:2]
+    img_cx, img_cy = w // 2, h // 2
 
     boxes = results[0].boxes
-    kpts = getattr(results[0], "keypoints", None)
+    kpts_obj = getattr(results[0], "keypoints", None)
 
-    h_img, w_img = frame.shape[:2]
-    img_cx, img_cy = w_img // 2, h_img // 2
-
-    # 用于记录最佳目标（最近）
-    best_found = False
-    best_dist2 = 1e18
-    best_pos_dx = best_pos_dy = 0.0
-    best_att_dx = best_att_dy = 0.0
-    best_box = None
-
-    # 如果没有检测结果
     if boxes is None or len(boxes) == 0:
-        result_dict = {
-            "timestamp": time.time(),
-            "x_error": 0.0,
-            "y_error": 0.0,
-            "z_error": 0.0,
-            "roll_error": 0.0,
-            "pitch_error": 0.0,
-            "yaw_error": 0.0,
-        }
-        latest_offset = {"pos_dx": 0, "pos_dy": 0, "att_dx": 0, "att_dy": 0}
-        write_to_shm(result_dict)
         return frame
 
-    # =============================
-    #   扫描所有框，画图 + 找最近目标
-    # =============================
+    best_i = -1
+    best_d2 = 1e18
+
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        conf = float(box.conf[0])
-        cls = int(box.cls[0])
-        label = model.names.get(cls, str(cls))
-
-        # 绘制框和中心
-        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-        cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)
-
-        # --- 位置偏差（百分比）
-        pos_dx = (cx - img_cx) / (w_img / 2) * 100
-        pos_dy = (cy - img_cy) / (h_img / 2) * 100
-
-        # --- 姿态偏差（关键点）
-        att_dx, att_dy = 0.0, 0.0
-        if kpts is not None and i < len(kpts.xy):
-            for kp in kpts.xy[i]:
-                px, py = int(kp[0]), int(kp[1])
-                cv2.circle(frame, (px, py), 5, (0, 0, 255), -1)
-                cv2.line(frame, (cx, cy), (px, py), (200, 50, 255), 2)
-
-                w_box = x2 - x1
-                h_box = y2 - y1
-                if w_box > 0 and h_box > 0:
-                    att_dx = (px - cx) / (w_box / 2) * 100
-                    att_dy = (py - cy) / (h_box / 2) * 100
-
-        # 绘制文字
-        text = (
-            f"{label} POS({pos_dx:+.1f},{pos_dy:+.1f}) "
-            f"ATT({att_dx:+.1f},{att_dy:+.1f})"
-        )
-        cv2.putText(
-            frame,
-            text,
-            (x1, y1 - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 255, 0),
-            1,
-        )
-
-        # --- 计算与图像中心的距离
-        dist2 = (cx - img_cx) ** 2 + (cy - img_cy) ** 2
-        if dist2 < best_dist2:
-            best_dist2 = dist2
-            best_found = True
-            best_pos_dx = pos_dx
-            best_pos_dy = pos_dy
-            best_att_dx = att_dx
-            best_att_dy = att_dy
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        d2 = (cx - img_cx) ** 2 + (cy - img_cy) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best_i = i
             best_box = (x1, y1, x2, y2)
 
-    # =============================
-    #   最近目标 → 计算 z_error 并写入 shared memory
-    # =============================
-    if best_found and best_box is not None:
-        x1, y1, x2, y2 = best_box
-        h_box = y2 - y1
+    x1, y1, x2, y2 = best_box
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-        # 🔵 你可以根据相机情况调整 ref_h（理想距离下的像素高度）
-        ref_h = 200.0  # <== 想离近一点就调大，想远一点就调小
+    pos_dx = (cx - img_cx) / (w / 2) * 100
+    pos_dy = (cy - img_cy) / (h / 2) * 100
 
-        # z_error = (期望 - 实际) / 期望
-        z_error = (ref_h - h_box) / ref_h
-        z_error = max(min(z_error, 1.0), -1.0)  # 限幅 [-1, 1]
+    h_box = max(1, y2 - y1)
+    ref_h = REF_H_RATIO * h
+    z_raw = (ref_h - h_box) / ref_h
+    z_raw = np.clip(z_raw, -1.0, 1.0)
+    z_error = lpf(last_z_error, z_raw, Z_LPF_ALPHA)
+    last_z_error = z_error
 
-        # 输出给共享内存
-        latest_offset = {
-            "pos_dx": best_pos_dx,
-            "pos_dy": best_pos_dy,
-            "att_dx": best_att_dx,
-            "att_dy": best_att_dy,
-            "z_error": z_error,
-        }
+    pitch_error = last_pitch_error
+    yaw_error = last_yaw_error
 
-        shm_dict = {
-            "timestamp": time.time(),
-            "x_error": best_pos_dx,
-            "y_error": best_pos_dy,
-            "z_error": z_error,
-            "roll_error": 0.0,
-            "pitch_error": 0.0,
-            "yaw_error": 0.0,
-        }
-        write_to_shm(shm_dict)
+    if kpts_obj is not None:
+        kdata = results[0].keypoints.data[best_i].cpu().numpy()
+        if kdata.shape[0] >= 5 and np.all(kdata[:5, 2] >= 2):
+            kxy = kdata[:5, :2]
+            bbox_center = np.array([cx, cy], dtype=np.float32)
+            roles = assign_5kpts_roles(kxy, bbox_center)
 
-        # 在图像上标亮最近目标
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.putText(frame, f"NEAREST z={z_error:+.2f}",
-                    (x1, y1 - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0, 255, 0), 2)
+            if roles["U"][1] < roles["D"][1] and roles["L"][0] < roles["R"][0]:
+                raw_pitch, raw_yaw = estimate_pitch_yaw(
+                    roles["C"], roles["U"], roles["D"],
+                    roles["L"], roles["R"],
+                    bbox_center
+                )
+                pitch_error = lpf(last_pitch_error, raw_pitch, ATT_LPF_ALPHA)
+                yaw_error   = lpf(last_yaw_error, raw_yaw, ATT_LPF_ALPHA)
+                last_pitch_error = pitch_error
+                last_yaw_error   = yaw_error
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)
+
+    shm = {
+        "timestamp": time.time(),
+        "x_error": float(pos_dx),
+        "y_error": float(pos_dy),
+        "z_error": float(z_error),
+        "roll_error": 0.0,
+        "pitch_error": float(pitch_error),
+        "yaw_error": float(yaw_error),
+    }
+    write_to_shm(shm)
+
+    latest_offset.update({
+        "pos_dx": pos_dx,
+        "pos_dy": pos_dy,
+        "z_error": z_error,
+        "pitch_error": pitch_error,
+        "yaw_error": yaw_error,
+    })
 
     return frame
 
-
-
-# --- Video track (用于 WebRTC 模式) ---
-class AdaptiveStreamTrack(VideoStreamTrack):
-    def __init__(self, mode="raw"):
+# =========================================================
+# WebRTC Track
+# =========================================================
+class YoloStreamTrack(VideoStreamTrack):
+    def __init__(self):
         super().__init__()
-        self.mode = mode
-        self.last = time.time()
-        self.count = 0
+        self.last_infer = 0.0
+        self.last_results = None
+        self.last_fps_time = time.time()
+        self.frames = 0
         self.fps = 0.0
-        self.last_yolo_result = None
-        self.last_infer_time = 0.05
 
     async def recv(self):
-        global latest_frame
         pts, time_base = await self.next_timestamp()
-        if latest_frame is None:
-            frame = np.zeros((480, 640, 3), np.uint8)
-            cv2.putText(
-                frame,
-                "No Camera Feed",
-                (100, 240),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                2,
-            )
-        else:
-            frame = latest_frame.copy()
-            if self.mode == "yolo":
-                t0 = time.time()
-                self.last_yolo_result = await run_yolo_async(frame)
-                self.last_infer_time = time.time() - t0
-                frame = draw_results(frame, self.last_yolo_result)
-                cv2.putText(
-                    frame,
-                    "YOLOv8 Docking Monitor",
-                    (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (255, 128, 0),
-                    3,
-                )
+        frame = latest_frame.copy() if latest_frame is not None else np.zeros((480, 640, 3), np.uint8)
 
-            frame = cv2.resize(frame, (1280, 720))
-            self.count += 1
-            now = time.time()
-            if now - self.last >= 1.0:
-                self.fps = self.count / (now - self.last)
-                self.count = 0
-                self.last = now
-            cv2.putText(
-                frame,
-                f"{self.mode.upper()} FPS:{self.fps:.1f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0) if self.mode == "raw" else (255, 128, 0),
-                2,
-            )
+        now = time.time()
+        if self.last_results is None or (now - self.last_infer) >= YOLO_PERIOD:
+            self.last_results = await run_yolo_async(frame)
+            self.last_infer = now
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        vf = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
+        frame = process_and_draw(frame, self.last_results)
+
+        self.frames += 1
+        if now - self.last_fps_time > 1.0:
+            self.fps = self.frames / (now - self.last_fps_time)
+            self.frames = 0
+            self.last_fps_time = now
+
+        draw_hud(
+            frame,
+            latest_offset["pos_dx"],
+            latest_offset["pos_dy"],
+            latest_offset["z_error"],
+            latest_offset["pitch_error"],
+            latest_offset["yaw_error"],
+            self.fps,
+        )
+
+        frame = cv2.resize(frame, (1280, 720))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        vf = VideoFrame.from_ndarray(frame, format="rgb24")
         vf.pts, vf.time_base = pts, time_base
         return vf
 
-
-# --- Offer handlers ---
-async def offer_generic(request, mode="raw"):
+# =========================================================
+# Web Server
+# =========================================================
+async def offer_yolo(request):
     params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    offer = RTCSessionDescription(**params)
     pc = RTCPeerConnection()
     pcs.add(pc)
+
     pc.addTransceiver("video", direction="sendonly")
-    track = AdaptiveStreamTrack(mode)
-    pc.addTrack(track)
+    pc.addTrack(YoloStreamTrack())
+
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    return web.json_response(
-        {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-    )
 
+    return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
-async def offer_raw(request):
-    return await offer_generic(request, "raw")
-
-
-async def offer_yolo(request):
-    return await offer_generic(request, "yolo")
-
-
-# --- Offset data endpoint ---
-async def get_offset(request):
-    return web.json_response(latest_offset)
-
-
-# --- Startup / Shutdown (仅 WebRTC 模式用) ---
 async def on_startup(app):
-    print("🚀 Starting capture loop...")
     app["cap_task"] = asyncio.create_task(capture_loop())
-
 
 async def on_shutdown(app):
     global stop_flag
     stop_flag = True
     app["cap_task"].cancel()
-    for pc in list(pcs):
+    for pc in pcs:
         await pc.close()
-        pcs.discard(pc)
     cap.release()
-    print("✅ Shutdown complete")
+    executor.shutdown(wait=False)
 
-
-# --- App setup (WebRTC 模式用) ---
-app = web.Application()
-app.router.add_post("/offer_raw", offer_raw)
-app.router.add_post("/offer_yolo", offer_yolo)
-app.router.add_get("/offset", get_offset)
-app.router.add_static("/", path=".", show_index=True)
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
-
-
-# --- YOLO-only 模式：只推理 + 写共享内存，不启动 WebRTC ---
+# =========================================================
+# YOLO-only Mode
+# =========================================================
 async def yolo_only_loop():
     global stop_flag
-    print("🚀 YOLO-only shared memory mode started (no WebRTC)")
-    try:
-        while not stop_flag:
-            ret, frame = cap.read()
-            if not ret:
-                await asyncio.sleep(0.01)
-                continue
-
-            # 与 WebRTC 中的 YOLO 完全共用同一套逻辑
-            results = await run_yolo_async(frame)
-            _ = draw_results(frame, results)  # 不需要显示，只为了计算 + 写 shm
-
-            # 适当睡一点，避免把 CPU 吃满
-            await asyncio.sleep(0.001)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        print("🛑 YOLO-only loop stopped")
-
-
-async def yolo_only_main():
-    global stop_flag
     stop_flag = False
-    task = asyncio.create_task(yolo_only_loop())
-    try:
-        await task
-    finally:
-        stop_flag = True
-        cap.release()
-        executor.shutdown(wait=False)
-        print("✅ YOLO-only mode shutdown complete")
+    last_infer = 0.0
+    last_results = None
+    while not stop_flag:
+        ret, frame = cap.read()
+        if not ret:
+            await asyncio.sleep(0.01)
+            continue
+        now = time.time()
+        if last_results is None or (now - last_infer) >= YOLO_PERIOD:
+            last_results = await run_yolo_async(frame)
+            last_infer = now
+        process_and_draw(frame, last_results)
+        await asyncio.sleep(0.005)
 
-
+# =========================================================
+# Main
+# =========================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="YOLOv8 + WebRTC docking monitor / shared memory server"
-    )
-    parser.add_argument(
-        "--no-webrtc",
-        action="store_true",
-        help="Disable WebRTC server and only run YOLO inference + shared memory output",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-webrtc", action="store_true")
     args = parser.parse_args()
 
     if args.no_webrtc:
-        # 纯推理 + 写共享内存模式
-        try:
-            asyncio.run(yolo_only_main())
-        except KeyboardInterrupt:
-            print("🧹 Interrupted by user (Ctrl+C)")
+        asyncio.run(yolo_only_loop())
     else:
-        # 原来的完整 WebRTC 服务器模式
-        print(
-            "🌐 YOLOv8 Docking Visualization Server running at http://0.0.0.0:8080"
-        )
+        app = web.Application()
+        app.router.add_post("/offer_yolo", offer_yolo)
+        app.on_startup.append(on_startup)
+        app.on_shutdown.append(on_shutdown)
+        print("YOLO docking server running on :8080 (/offer_yolo)")
         web.run_app(app, host="0.0.0.0", port=8080)
