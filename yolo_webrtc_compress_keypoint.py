@@ -56,9 +56,18 @@ def draw_results(frame, results):
 
         # 如果存在关键点数据
         if kpts is not None and i < len(kpts.xy):
-            for kp in kpts.xy[i]:
-                px, py = int(kp[0]), int(kp[1])
-                cv2.circle(frame, (px, py), 5, (0, 0, 255), -1)  # 红点
+			keypoints = kpts.xy[i]
+
+            for idx, (px,py) in enumerate(keypoints):
+                px, py = int(px), int(py)
+
+		# Color for each keypoint
+		colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0),
+			(0, 255, 255),(255, 0, 255)]
+                cv2.circle(frame, (px, py), 5, colors[idx % len(colors)], -1)
+
+		# Draw a line from center to each keypoint
+		cv2.line(frame, (cx, cy), (px, py), (200,200,200),1)
 
                 # 连线关键点与四角
                 for (x, y) in [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]:

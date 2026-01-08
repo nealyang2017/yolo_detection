@@ -17,6 +17,7 @@ import tempfile
 import argparse  # ✅ 新增：命令行参数
 
 
+
 # --- Model & camera setup ---
 model = YOLO("./models/valve.pt")  # 你的Pose模型
 cap = cv2.VideoCapture("/dev/video0")
@@ -73,6 +74,7 @@ def draw_results(frame, results):
 
     boxes = results[0].boxes
     kpts = getattr(results[0], "keypoints", None)
+    print("DEBUG keypoints:", kpts)
 
     h_img, w_img = frame.shape[:2]
     img_cx, img_cy = w_img // 2, h_img // 2
@@ -112,6 +114,22 @@ def draw_results(frame, results):
         cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
         cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)
+
+        # --- Draw keypoints (for visualization)
+        if kpts is not None and i < len(kpts.xy):
+            for idx, (px, py) in enumerate(kpts.xy[i]):
+                px, py = int(px), int(py)
+
+                # Color-coded keypoints (for visualization)
+                colors = [
+                    (0, 0, 255),
+                    (0, 255, 0),
+                    (255, 0, 0),
+                    (0, 255, 255),
+                    (255, 0, 255),
+                ]
+
+                cv2.circle(frame, (px, py), 5, colors[idx % len(colors)], -1)
 
         # --- 位置偏差（百分比）
         pos_dx = (cx - img_cx) / (w_img / 2) * 100
@@ -185,8 +203,10 @@ def draw_results(frame, results):
             "x_error": best_pos_dx,
             "y_error": best_pos_dy,
             "z_error": z_error,
-            "roll_error": 0.0,
-            "pitch_error": 0.0,
+            "roll_error": best_att_dx,
+            #"pitch_error": 0.0,
+            "pitch_error": best_att_dy,
+            #"yaw_error": 0.0,
             "yaw_error": 0.0,
         }
         write_to_shm(shm_dict)
