@@ -19,10 +19,28 @@ import argparse  # ✅ 新增：命令行参数
 
 
 # --- Model & camera setup ---
-model = YOLO("./models/valve.pt")  # 你的Pose模型
+model = YOLO("./yolo_detection/models/valve_fivepoints.pt")  # 你的Pose模型
 cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
     print("❌ Cannot open /dev/video0")
+
+# ===============================
+# 🔍 模型 & keypoints 自检（只跑一次）
+# ===============================
+print("MODEL PATH:", model.ckpt_path if hasattr(model, "ckpt_path") else "unknown")
+print("MODEL NAMES:", model.names)
+
+ret, _f = cap.read()
+if ret:
+    _r = model(_f, verbose=False)
+    _k = getattr(_r[0], "keypoints", None)
+    if _k is None:
+        print("DEBUG: keypoints is None (not a pose model?)")
+    else:
+        print("DEBUG kpts.xy shape:", _k.xy.shape if hasattr(_k, "xy") else None)
+        print("DEBUG kpts.data shape:", _k.data.shape if hasattr(_k, "data") else None)
+else:
+    print("⚠️ Could not read a frame for keypoint check")
 
 pcs = set()
 latest_frame = None
